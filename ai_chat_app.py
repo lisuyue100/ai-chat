@@ -137,6 +137,13 @@ HTML_CONTENT = """
             border-bottom-left-radius: 5px;
         }
 
+        .audio-container {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
         .audio-button {
             background: #667eea;
             color: white;
@@ -242,6 +249,12 @@ HTML_CONTENT = """
             width: 100%;
             max-width: 300px;
         }
+
+        .debug-info {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
@@ -286,10 +299,12 @@ HTML_CONTENT = """
 
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
+                console.log('收到消息:', data);
 
                 if (data.type === 'text') {
                     addOrUpdateMessage(data.content, 'assistant', data.message_id);
                 } else if (data.type === 'audio') {
+                    console.log('添加音频:', data.message_id);
                     addAudioToMessage(data.message_id, data.audio_data);
                 } else if (data.type === 'done') {
                     console.log('对话完成');
@@ -387,20 +402,43 @@ HTML_CONTENT = """
             let messageElement = document.getElementById(messageId);
 
             if (messageElement) {
-                const audioDiv = document.createElement('div');
-                audioDiv.style.marginTop = '10px';
-                
-                const audio = document.createElement('audio');
-                audio.controls = true;
-                audio.style.maxWidth = '100%';
-                audio.style.borderRadius = '8px';
-                
-                const audioBlob = base64ToBlob(audioBase64, 'audio/pcm');
-                const audioUrl = URL.createObjectURL(audioBlob);
-                audio.src = audioUrl;
-                
-                audioDiv.appendChild(audio);
-                messageElement.appendChild(audioDiv);
+                // 检查是否已有音频容器
+                let audioContainer = messageElement.querySelector('.audio-container');
+                if (!audioContainer) {
+                    audioContainer = document.createElement('div');
+                    audioContainer.className = 'audio-container';
+                    messageElement.appendChild(audioContainer);
+                }
+
+                try {
+                    // 转换 Base64 为 ArrayBuffer
+                    const byteCharacters = atob(audioBase64);
+                    const byteNumbers = new Array(byteCharacters.length);
+                    for (let i = 0; i < byteCharacters.length; i++) {
+                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+
+                    // 创建音频 Blob（使用 PCM 格式）
+                    const audioBlob = new Blob([byteArray], { type: 'audio/wav' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
+
+                    // 创建音频元素
+                    const audio = document.createElement('audio');
+                    audio.controls = true;
+                    audio.autoplay = true;
+                    audio.src = audioUrl;
+                    
+                    audioContainer.appendChild(audio);
+                    console.log('音频已添加:', audioUrl);
+
+                } catch (e) {
+                    console.error('音频处理失败:', e);
+                    const errorDiv = document.createElement('div');
+                    errorDiv.style.color = 'red';
+                    errorDiv.textContent = '❌ 音频加载失败';
+                    audioContainer.appendChild(errorDiv);
+                }
             }
         }
 
@@ -421,21 +459,6 @@ HTML_CONTENT = """
             messageDiv.appendChild(contentDiv);
             chatArea.appendChild(messageDiv);
             chatArea.scrollTop = chatArea.scrollHeight;
-        }
-
-        // =========================
-        // Base64 转 Blob
-        // =========================
-        function base64ToBlob(base64, mimeType) {
-            const byteCharacters = atob(base64);
-            const byteNumbers = new Array(byteCharacters.length);
-            
-            for (let i = 0; i < byteCharacters.length; i++) {
-                byteNumbers[i] = byteCharacters.charCodeAt(i);
-            }
-            
-            const byteArray = new Uint8Array(byteNumbers);
-            return new Blob([byteArray], { type: mimeType });
         }
 
         // =========================
@@ -506,6 +529,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 message_id = f"msg-{len(conversation_history)}"
                 assistant_reply = ""
+                audio_chunks = []
 
                 try:
                     # 请求 API
@@ -522,12 +546,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         }
                     )
 
+                    print(f"[{message_id}] 开始流式处理...")
+
                     # 流式处理
                     for chunk in stream:
                         delta = chunk.choices[0].delta
 
                         # 处理文本
                         if hasattr(delta, "content") and delta.content:
+                            print(f"[{message_id}] 收到文本: {delta.content}")
                             await websocket.send_json({
                                 "type": "text",
                                 "content": delta.content,
@@ -538,25 +565,53 @@ async def websocket_endpoint(websocket: WebSocket):
                         # 处理音频
                         if hasattr(delta, "audio") and delta.audio:
                             audio_data = delta.audio
+                            print(f"[{message_id}] 收到音频数据")
 
                             try:
+                                # 尝试不同的音频数据格式
+                                audio_bytes = None
+                                
                                 if isinstance(audio_data, str):
+                                    # 直接 Base64 字符串
                                     audio_bytes = base64.b64decode(audio_data)
-                                elif hasattr(audio_data, "data") and audio_data.data:
-                                    audio_bytes = base64.b64decode(audio_data.data)
-                                else:
-                                    continue
+                                    print(f"[{message_id}] 直接 Base64 字符串: {len(audio_bytes)} bytes")
+                                    
+                                elif hasattr(audio_data, "data"):
+                                    # 对象中的 data 属性
+                                    if isinstance(audio_data.data, str):
+                                        audio_bytes = base64.b64decode(audio_data.data)
+                                    else:
+                                        audio_bytes = audio_data.data
+                                    print(f"[{message_id}] 对象数据: {len(audio_bytes)} bytes")
+                                    
+                                elif isinstance(audio_data, bytes):
+                                    # 直接字节
+                                    audio_bytes = audio_data
+                                    print(f"[{message_id}] 直接字节: {len(audio_bytes)} bytes")
 
-                                # 编码为 Base64 发送到前端
-                                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-                                await websocket.send_json({
-                                    "type": "audio",
-                                    "audio_data": audio_base64,
-                                    "message_id": message_id
-                                })
+                                if audio_bytes:
+                                    # 收集所有音频块
+                                    audio_chunks.append(audio_bytes)
 
                             except Exception as e:
-                                print(f"音频处理错误: {e}")
+                                print(f"[{message_id}] 音频处理错误: {e}")
+                                import traceback
+                                traceback.print_exc()
+
+                    # 流式处理完成，发送完整的音频
+                    if audio_chunks:
+                        print(f"[{message_id}] 发送 {len(audio_chunks)} 块音频")
+                        complete_audio = b''.join(audio_chunks)
+                        audio_base64 = base64.b64encode(complete_audio).decode('utf-8')
+                        
+                        await websocket.send_json({
+                            "type": "audio",
+                            "audio_data": audio_base64,
+                            "message_id": message_id
+                        })
+                        print(f"[{message_id}] 音频已发送: {len(audio_base64)} chars")
+                    else:
+                        print(f"[{message_id}] 没有收到音频数据")
 
                     # 添加 AI 回复到历史（LongCat API 特殊要求）
                     conversation_history.append({
@@ -569,9 +624,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "done",
                         "message_id": message_id
                     })
+                    print(f"[{message_id}] 完成")
 
                 except Exception as e:
-                    print(f"API 请求错误: {e}")
+                    print(f"[{message_id}] API 请求错误: {e}")
+                    import traceback
+                    traceback.print_exc()
                     await websocket.send_json({
                         "type": "error",
                         "error": str(e)
@@ -579,6 +637,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except Exception as e:
         print(f"WebSocket 错误: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         await websocket.close()
 
