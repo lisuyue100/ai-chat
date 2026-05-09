@@ -35,42 +35,6 @@ conversation_history: List[Dict] = [
 ]
 
 # =========================
-# PCM 转 WAV 函数
-# =========================
-def pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
-    """将 PCM 字节转换为 WAV 格式"""
-    
-    # WAV 文件头参数
-    num_samples = len(pcm_data) // sample_width
-    byte_rate = sample_rate * channels * sample_width
-    block_align = channels * sample_width
-    
-    # 创建 WAV 文件头
-    wav_buffer = io.BytesIO()
-    
-    # RIFF chunk descriptor
-    wav_buffer.write(b'RIFF')
-    wav_buffer.write(struct.pack('<I', 36 + len(pcm_data)))  # chunk size
-    wav_buffer.write(b'WAVE')
-    
-    # fmt sub-chunk
-    wav_buffer.write(b'fmt ')
-    wav_buffer.write(struct.pack('<I', 16))  # subchunk1 size
-    wav_buffer.write(struct.pack('<H', 1))   # audio format (1 = PCM)
-    wav_buffer.write(struct.pack('<H', channels))  # num channels
-    wav_buffer.write(struct.pack('<I', sample_rate))  # sample rate
-    wav_buffer.write(struct.pack('<I', byte_rate))  # byte rate
-    wav_buffer.write(struct.pack('<H', block_align))  # block align
-    wav_buffer.write(struct.pack('<H', sample_width * 8))  # bits per sample
-    
-    # data sub-chunk
-    wav_buffer.write(b'data')
-    wav_buffer.write(struct.pack('<I', len(pcm_data)))
-    wav_buffer.write(pcm_data)
-    
-    return wav_buffer.getvalue()
-
-# =========================
 # HTML 前端
 # =========================
 HTML_CONTENT = """
@@ -183,24 +147,20 @@ HTML_CONTENT = """
             align-items: center;
         }
 
-        .audio-button {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 8px 12px;
-            border-radius: 8px;
-            cursor: pointer;
+        .audio-status {
             font-size: 12px;
-            transition: background 0.3s;
+            color: #667eea;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
 
-        .audio-button:hover {
-            background: #764ba2;
+        .audio-status.playing::before {
+            content: '🔊';
         }
 
-        .audio-button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
+        .audio-status.done::before {
+            content: '✅';
         }
 
         .input-area {
@@ -254,45 +214,12 @@ HTML_CONTENT = """
             cursor: not-allowed;
         }
 
-        .loading {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            color: #667eea;
-            font-size: 14px;
-        }
-
-        .spinner {
-            width: 16px;
-            height: 16px;
-            border: 2px solid #f3f3f3;
-            border-top: 2px solid #667eea;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
         .status {
             padding: 10px 20px;
             text-align: center;
             font-size: 12px;
             color: #999;
             background: #f5f5f5;
-        }
-
-        audio {
-            width: 100%;
-            max-width: 300px;
-        }
-
-        .debug-info {
-            font-size: 12px;
-            color: #999;
-            margin-top: 5px;
         }
     </style>
 </head>
@@ -325,6 +252,90 @@ HTML_CONTENT = """
         let isConnected = false;
 
         // =========================
+        // Web Audio API 流式播放器
+        // =========================
+        class StreamingAudioPlayer {
+            constructor() {
+                this.audioContext = null;
+                this.currentSource = null;
+                this.audioBuffers = {};
+                this.playbackPositions = {};
+                this.isPlaying = {};
+            }
+
+            async init() {
+                if (!this.audioContext) {
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+            }
+
+            // 添加 PCM 数据块
+            async addAudioChunk(messageId, pcmData, sampleRate = 24000) {
+                await this.init();
+
+                // 将字节转换为 Float32Array
+                const pcmArray = new Float32Array(pcmData.length / 2);
+                const view = new DataView(pcmData);
+                
+                for (let i = 0; i < pcmArray.length; i++) {
+                    pcmArray[i] = view.getInt16(i * 2, true) / 32768.0;
+                }
+
+                // 创建 AudioBuffer
+                const audioBuffer = this.audioContext.createBuffer(
+                    1,  // mono
+                    pcmArray.length,
+                    sampleRate
+                );
+                audioBuffer.getChannelData(0).set(pcmArray);
+
+                // 存储或追加到缓冲区
+                if (!this.audioBuffers[messageId]) {
+                    this.audioBuffers[messageId] = [];
+                    this.playbackPositions[messageId] = 0;
+                    this.isPlaying[messageId] = false;
+                }
+
+                this.audioBuffers[messageId].push(audioBuffer);
+
+                // 如果还没开始播放，现在开始
+                if (!this.isPlaying[messageId]) {
+                    this.isPlaying[messageId] = true;
+                    await this.playChunks(messageId, sampleRate);
+                }
+            }
+
+            // 连续播放所有块
+            async playChunks(messageId, sampleRate = 24000) {
+                for (const audioBuffer of this.audioBuffers[messageId]) {
+                    await this.playBuffer(audioBuffer);
+                }
+            }
+
+            // 播放单个 AudioBuffer
+            playBuffer(audioBuffer) {
+                return new Promise((resolve) => {
+                    const source = this.audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(this.audioContext.destination);
+                    
+                    source.onended = () => {
+                        resolve();
+                    };
+                    
+                    source.start(0);
+                });
+            }
+
+            // 标记播放完成
+            markDone(messageId) {
+                this.isPlaying[messageId] = false;
+            }
+        }
+
+        const audioPlayer = new StreamingAudioPlayer();
+
+        // =========================
         // WebSocket 连接
         // =========================
         function connectWebSocket() {
@@ -338,15 +349,15 @@ HTML_CONTENT = """
 
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
-                console.log('📨 收到消息:', data.type);
 
                 if (data.type === 'text') {
                     addOrUpdateMessage(data.content, 'assistant', data.message_id);
                 } else if (data.type === 'audio') {
-                    console.log('🔊 添加音频:', data.message_id);
-                    addAudioToMessage(data.message_id, data.audio_data);
+                    console.log('🔊 收到音频块:', data.message_id);
+                    playAudioChunk(data.message_id, data.audio_data);
                 } else if (data.type === 'done') {
                     console.log('✅ 对话完成');
+                    markAudioDone(data.message_id);
                     enableInput();
                 } else if (data.type === 'error') {
                     addErrorMessage(data.error);
@@ -367,6 +378,44 @@ HTML_CONTENT = """
         }
 
         // =========================
+        // 播放音频块
+        // =========================
+        async function playAudioChunk(messageId, audioBase64) {
+            try {
+                // Base64 转字节
+                const byteCharacters = atob(audioBase64);
+                const byteNumbers = new Array(byteCharacters.length);
+                for (let i = 0; i < byteCharacters.length; i++) {
+                    byteNumbers[i] = byteCharacters.charCodeAt(i);
+                }
+                const byteArray = new Uint8Array(byteNumbers);
+
+                // 添加到播放器
+                await audioPlayer.addAudioChunk(messageId, byteArray.buffer, 24000);
+                console.log('✅ 音频块已开始播放');
+
+            } catch (e) {
+                console.error('❌ 音频播放失败:', e);
+                addErrorMessage('音频播放失败: ' + e.message);
+            }
+        }
+
+        // =========================
+        // 标记音频播放完成
+        // =========================
+        function markAudioDone(messageId) {
+            audioPlayer.markDone(messageId);
+            const audioContainer = document.querySelector(`#${messageId} .audio-container`);
+            if (audioContainer) {
+                const status = audioContainer.querySelector('.audio-status');
+                if (status) {
+                    status.className = 'audio-status done';
+                    status.textContent = '音频已播放完成';
+                }
+            }
+        }
+
+        // =========================
         // 发送消息
         // =========================
         function sendMessage() {
@@ -378,14 +427,11 @@ HTML_CONTENT = """
                 return;
             }
 
-            // 清空输入
             messageInput.value = '';
             disableInput();
 
-            // 显示用户消息
             addMessage(text, 'user');
 
-            // 发送到后端
             ws.send(JSON.stringify({
                 type: 'message',
                 content: text
@@ -425,6 +471,18 @@ HTML_CONTENT = """
                 contentDiv.textContent = text;
                 
                 messageDiv.appendChild(contentDiv);
+
+                // 添加音频容器
+                const audioContainer = document.createElement('div');
+                audioContainer.className = 'audio-container';
+                
+                const audioStatus = document.createElement('div');
+                audioStatus.className = 'audio-status playing';
+                audioStatus.textContent = '音频播放中...';
+                
+                audioContainer.appendChild(audioStatus);
+                messageDiv.appendChild(audioContainer);
+
                 chatArea.appendChild(messageDiv);
             } else {
                 const contentDiv = document.getElementById(`${messageId}-content`);
@@ -432,55 +490,6 @@ HTML_CONTENT = """
             }
 
             chatArea.scrollTop = chatArea.scrollHeight;
-        }
-
-        // =========================
-        // 添加音频到消息
-        // =========================
-        function addAudioToMessage(messageId, audioBase64) {
-            let messageElement = document.getElementById(messageId);
-
-            if (messageElement) {
-                // 检查是否已有音频容器
-                let audioContainer = messageElement.querySelector('.audio-container');
-                if (!audioContainer) {
-                    audioContainer = document.createElement('div');
-                    audioContainer.className = 'audio-container';
-                    messageElement.appendChild(audioContainer);
-                }
-
-                try {
-                    // 转换 Base64 为 Blob
-                    const byteCharacters = atob(audioBase64);
-                    const byteNumbers = new Array(byteCharacters.length);
-                    for (let i = 0; i < byteCharacters.length; i++) {
-                        byteNumbers[i] = byteCharacters.charCodeAt(i);
-                    }
-                    const byteArray = new Uint8Array(byteNumbers);
-
-                    // 使用 WAV 格式
-                    const audioBlob = new Blob([byteArray], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(audioBlob);
-
-                    // 创建音频元素
-                    const audio = document.createElement('audio');
-                    audio.controls = true;
-                    audio.autoplay = true;
-                    audio.style.width = '100%';
-                    audio.style.maxWidth = '300px';
-                    audio.src = audioUrl;
-                    
-                    audioContainer.appendChild(audio);
-                    console.log('✅ 音频已添加并自动播放');
-
-                } catch (e) {
-                    console.error('❌ 音频处理失败:', e);
-                    const errorDiv = document.createElement('div');
-                    errorDiv.style.color = 'red';
-                    errorDiv.textContent = '❌ 音频加载失败';
-                    audioContainer.appendChild(errorDiv);
-                }
-            }
         }
 
         // =========================
@@ -542,7 +551,7 @@ async def get_root():
     return HTMLResponse(content=HTML_CONTENT)
 
 # =========================
-# 路由：favicon（解决 404 错误）
+# 路由：favicon
 # =========================
 @app.get("/favicon.ico")
 async def favicon():
@@ -562,7 +571,6 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            # 接收客户端消息
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
@@ -572,7 +580,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not user_message:
                     continue
 
-                # 添加用户消息到历史（LongCat API 特殊要求）
                 conversation_history.append({
                     "role": "user",
                     "content": [{"type": "text", "text": user_message}]
@@ -580,10 +587,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 message_id = f"msg-{len(conversation_history)}"
                 assistant_reply = ""
-                audio_chunks = []
 
                 try:
-                    # 请求 API
                     stream = client.chat.completions.create(
                         model="LongCat-Flash-Omni-2603",
                         messages=conversation_history,
@@ -599,7 +604,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     print(f"[{message_id}] 开始流式处理...")
 
-                    # 流式处理
                     for chunk in stream:
                         delta = chunk.choices[0].delta
 
@@ -613,62 +617,40 @@ async def websocket_endpoint(websocket: WebSocket):
                             })
                             assistant_reply += delta.content
 
-                        # 处理音频
+                        # 处理音频 - 立即发送每个块，不等待完整音频
                         if hasattr(delta, "audio") and delta.audio:
                             audio_data = delta.audio
-                            print(f"[{message_id}] 收到音频数据")
+                            print(f"[{message_id}] 收到音频块")
 
                             try:
-                                # 尝试不同的音频数据格式
                                 audio_bytes = None
                                 
                                 if isinstance(audio_data, str):
-                                    # 直接 Base64 字符串
                                     audio_bytes = base64.b64decode(audio_data)
-                                    print(f"[{message_id}] 直接 Base64 字符串: {len(audio_bytes)} bytes")
-                                    
                                 elif hasattr(audio_data, "data"):
-                                    # 对象中的 data 属性
                                     if isinstance(audio_data.data, str):
                                         audio_bytes = base64.b64decode(audio_data.data)
                                     else:
                                         audio_bytes = audio_data.data
-                                    print(f"[{message_id}] 对象数据: {len(audio_bytes)} bytes")
-                                    
                                 elif isinstance(audio_data, bytes):
-                                    # 直接字节
                                     audio_bytes = audio_data
-                                    print(f"[{message_id}] 直接字节: {len(audio_bytes)} bytes")
 
                                 if audio_bytes:
-                                    # 收集所有音频块
-                                    audio_chunks.append(audio_bytes)
+                                    # 立即发送音频块（流式播放）
+                                    audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                                    await websocket.send_json({
+                                        "type": "audio",
+                                        "audio_data": audio_base64,
+                                        "message_id": message_id
+                                    })
+                                    print(f"[{message_id}] 音频块已发送: {len(audio_base64)} chars")
 
                             except Exception as e:
                                 print(f"[{message_id}] 音频处理错误: {e}")
                                 import traceback
                                 traceback.print_exc()
 
-                    # 流式处理完成，发送完整的音频
-                    if audio_chunks:
-                        print(f"[{message_id}] 收集 {len(audio_chunks)} 块音频")
-                        complete_audio = b''.join(audio_chunks)
-                        print(f"[{message_id}] 完整音频大小: {len(complete_audio)} bytes")
-                        
-                        # ⭐ 转换 PCM 为 WAV
-                        wav_data = pcm_to_wav(complete_audio, sample_rate=24000, channels=1, sample_width=2)
-                        audio_base64 = base64.b64encode(wav_data).decode('utf-8')
-                        
-                        await websocket.send_json({
-                            "type": "audio",
-                            "audio_data": audio_base64,
-                            "message_id": message_id
-                        })
-                        print(f"[{message_id}] WAV 音频已发送: {len(audio_base64)} chars")
-                    else:
-                        print(f"[{message_id}] 没有收到音频数据")
-
-                    # 添加 AI 回复到历史（LongCat API 特殊要求）
+                    # 添加 AI 回复到历史
                     conversation_history.append({
                         "role": "user",
                         "content": [{"type": "text", "text": assistant_reply}]
