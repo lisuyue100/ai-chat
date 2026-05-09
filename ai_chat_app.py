@@ -4,6 +4,8 @@ from fastapi.staticfiles import StaticFiles
 import asyncio
 import base64
 import json
+import struct
+import io
 from openai import OpenAI
 from typing import List, Dict
 
@@ -31,6 +33,42 @@ conversation_history: List[Dict] = [
         ]
     }
 ]
+
+# =========================
+# PCM 转 WAV 函数
+# =========================
+def pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
+    """将 PCM 字节转换为 WAV 格式"""
+    
+    # WAV 文件头参数
+    num_samples = len(pcm_data) // sample_width
+    byte_rate = sample_rate * channels * sample_width
+    block_align = channels * sample_width
+    
+    # 创建 WAV 文件头
+    wav_buffer = io.BytesIO()
+    
+    # RIFF chunk descriptor
+    wav_buffer.write(b'RIFF')
+    wav_buffer.write(struct.pack('<I', 36 + len(pcm_data)))  # chunk size
+    wav_buffer.write(b'WAVE')
+    
+    # fmt sub-chunk
+    wav_buffer.write(b'fmt ')
+    wav_buffer.write(struct.pack('<I', 16))  # subchunk1 size
+    wav_buffer.write(struct.pack('<H', 1))   # audio format (1 = PCM)
+    wav_buffer.write(struct.pack('<H', channels))  # num channels
+    wav_buffer.write(struct.pack('<I', sample_rate))  # sample rate
+    wav_buffer.write(struct.pack('<I', byte_rate))  # byte rate
+    wav_buffer.write(struct.pack('<H', block_align))  # block align
+    wav_buffer.write(struct.pack('<H', sample_width * 8))  # bits per sample
+    
+    # data sub-chunk
+    wav_buffer.write(b'data')
+    wav_buffer.write(struct.pack('<I', len(pcm_data)))
+    wav_buffer.write(pcm_data)
+    
+    return wav_buffer.getvalue()
 
 # =========================
 # HTML 前端
@@ -294,20 +332,20 @@ HTML_CONTENT = """
 
             ws.onopen = function() {
                 isConnected = true;
-                console.log('WebSocket 已连接');
+                console.log('✅ WebSocket 已连接');
             };
 
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
-                console.log('收到消息:', data);
+                console.log('📨 收到消息:', data.type);
 
                 if (data.type === 'text') {
                     addOrUpdateMessage(data.content, 'assistant', data.message_id);
                 } else if (data.type === 'audio') {
-                    console.log('添加音频:', data.message_id);
+                    console.log('🔊 添加音频:', data.message_id);
                     addAudioToMessage(data.message_id, data.audio_data);
                 } else if (data.type === 'done') {
-                    console.log('对话完成');
+                    console.log('✅ 对话完成');
                     enableInput();
                 } else if (data.type === 'error') {
                     addErrorMessage(data.error);
@@ -316,7 +354,7 @@ HTML_CONTENT = """
             };
 
             ws.onerror = function(error) {
-                console.error('WebSocket 错误:', error);
+                console.error('❌ WebSocket 错误:', error);
                 addErrorMessage('连接错误，请刷新页面');
             };
 
@@ -411,7 +449,7 @@ HTML_CONTENT = """
                 }
 
                 try {
-                    // 转换 Base64 为 ArrayBuffer
+                    // 转换 Base64 为 Blob
                     const byteCharacters = atob(audioBase64);
                     const byteNumbers = new Array(byteCharacters.length);
                     for (let i = 0; i < byteCharacters.length; i++) {
@@ -419,7 +457,7 @@ HTML_CONTENT = """
                     }
                     const byteArray = new Uint8Array(byteNumbers);
 
-                    // 创建音频 Blob（使用 PCM 格式）
+                    // 使用 WAV 格式
                     const audioBlob = new Blob([byteArray], { type: 'audio/wav' });
                     const audioUrl = URL.createObjectURL(audioBlob);
 
@@ -427,13 +465,15 @@ HTML_CONTENT = """
                     const audio = document.createElement('audio');
                     audio.controls = true;
                     audio.autoplay = true;
+                    audio.style.width = '100%';
+                    audio.style.maxWidth = '300px';
                     audio.src = audioUrl;
                     
                     audioContainer.appendChild(audio);
-                    console.log('音频已添加:', audioUrl);
+                    console.log('✅ 音频已添加并自动播放');
 
                 } catch (e) {
-                    console.error('音频处理失败:', e);
+                    console.error('❌ 音频处理失败:', e);
                     const errorDiv = document.createElement('div');
                     errorDiv.style.color = 'red';
                     errorDiv.textContent = '❌ 音频加载失败';
@@ -600,16 +640,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     # 流式处理完成，发送完整的音频
                     if audio_chunks:
-                        print(f"[{message_id}] 发送 {len(audio_chunks)} 块音频")
+                        print(f"[{message_id}] 收集 {len(audio_chunks)} 块音频")
                         complete_audio = b''.join(audio_chunks)
-                        audio_base64 = base64.b64encode(complete_audio).decode('utf-8')
+                        print(f"[{message_id}] 完整音频大小: {len(complete_audio)} bytes")
+                        
+                        # ⭐ 转换 PCM 为 WAV
+                        wav_data = pcm_to_wav(complete_audio, sample_rate=24000, channels=1, sample_width=2)
+                        audio_base64 = base64.b64encode(wav_data).decode('utf-8')
                         
                         await websocket.send_json({
                             "type": "audio",
                             "audio_data": audio_base64,
                             "message_id": message_id
                         })
-                        print(f"[{message_id}] 音频已发送: {len(audio_base64)} chars")
+                        print(f"[{message_id}] WAV 音频已发送: {len(audio_base64)} chars")
                     else:
                         print(f"[{message_id}] 没有收到音频数据")
 
@@ -637,10 +681,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except Exception as e:
         print(f"WebSocket 错误: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 # =========================
 # 启动服务
