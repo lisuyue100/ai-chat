@@ -80,6 +80,7 @@ HTML_CONTENT = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI 语音聊天</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='75' font-size='75'>🎤</text></svg>">
     <style>
         * {
             margin: 0;
@@ -539,6 +540,16 @@ HTML_CONTENT = """
 @app.get("/")
 async def get_root():
     return HTMLResponse(content=HTML_CONTENT)
+
+# =========================
+# 路由：favicon（解决 404 错误）
+# =========================
+@app.get("/favicon.ico")
+async def favicon():
+    return HTMLResponse(
+        content='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="75" font-size="75">🎤</text></svg>',
+        media_type="image/svg+xml"
+    )
 
 # =========================
 # WebSocket：处理对话
