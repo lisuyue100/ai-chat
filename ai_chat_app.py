@@ -145,14 +145,14 @@ HTML_CONTENT = """
             display: flex;
             gap: 10px;
             align-items: center;
+            font-size: 12px;
+            color: #667eea;
         }
 
         .audio-status {
-            font-size: 12px;
-            color: #667eea;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 5px;
         }
 
         .audio-status.playing::before {
@@ -257,79 +257,47 @@ HTML_CONTENT = """
         class StreamingAudioPlayer {
             constructor() {
                 this.audioContext = null;
-                this.currentSource = null;
-                this.audioBuffers = {};
-                this.playbackPositions = {};
-                this.isPlaying = {};
+                this.gainNode = null;
             }
 
             async init() {
                 if (!this.audioContext) {
                     this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    this.gainNode = this.audioContext.createGain();
+                    this.gainNode.connect(this.audioContext.destination);
                 }
             }
 
-            // 添加 PCM 数据块
-            async addAudioChunk(messageId, pcmData, sampleRate = 24000) {
+            // 立即播放单个 PCM 块
+            async playChunk(pcmData, sampleRate = 24000) {
                 await this.init();
 
-                // 将字节转换为 Float32Array
-                const pcmArray = new Float32Array(pcmData.length / 2);
-                const view = new DataView(pcmData);
-                
-                for (let i = 0; i < pcmArray.length; i++) {
-                    pcmArray[i] = view.getInt16(i * 2, true) / 32768.0;
-                }
+                try {
+                    // PCM 字节转 Float32Array
+                    const pcmArray = new Float32Array(pcmData.length / 2);
+                    const view = new DataView(pcmData);
+                    
+                    for (let i = 0; i < pcmArray.length; i++) {
+                        pcmArray[i] = view.getInt16(i * 2, true) / 32768.0;
+                    }
 
-                // 创建 AudioBuffer
-                const audioBuffer = this.audioContext.createBuffer(
-                    1,  // mono
-                    pcmArray.length,
-                    sampleRate
-                );
-                audioBuffer.getChannelData(0).set(pcmArray);
+                    // 创建 AudioBuffer
+                    const audioBuffer = this.audioContext.createBuffer(
+                        1,  // mono
+                        pcmArray.length,
+                        sampleRate
+                    );
+                    audioBuffer.getChannelData(0).set(pcmArray);
 
-                // 存储或追加到缓冲区
-                if (!this.audioBuffers[messageId]) {
-                    this.audioBuffers[messageId] = [];
-                    this.playbackPositions[messageId] = 0;
-                    this.isPlaying[messageId] = false;
-                }
-
-                this.audioBuffers[messageId].push(audioBuffer);
-
-                // 如果还没开始播放，现在开始
-                if (!this.isPlaying[messageId]) {
-                    this.isPlaying[messageId] = true;
-                    await this.playChunks(messageId, sampleRate);
-                }
-            }
-
-            // 连续播放所有块
-            async playChunks(messageId, sampleRate = 24000) {
-                for (const audioBuffer of this.audioBuffers[messageId]) {
-                    await this.playBuffer(audioBuffer);
-                }
-            }
-
-            // 播放单个 AudioBuffer
-            playBuffer(audioBuffer) {
-                return new Promise((resolve) => {
+                    // 立即播放
                     const source = this.audioContext.createBufferSource();
                     source.buffer = audioBuffer;
-                    source.connect(this.audioContext.destination);
-                    
-                    source.onended = () => {
-                        resolve();
-                    };
-                    
+                    source.connect(this.gainNode);
                     source.start(0);
-                });
-            }
 
-            // 标记播放完成
-            markDone(messageId) {
-                this.isPlaying[messageId] = false;
+                } catch (e) {
+                    console.error('音频处理失败:', e);
+                }
             }
         }
 
@@ -353,7 +321,7 @@ HTML_CONTENT = """
                 if (data.type === 'text') {
                     addOrUpdateMessage(data.content, 'assistant', data.message_id);
                 } else if (data.type === 'audio') {
-                    console.log('🔊 收到音频块:', data.message_id);
+                    console.log('🔊 收到音频块，立即播放');
                     playAudioChunk(data.message_id, data.audio_data);
                 } else if (data.type === 'done') {
                     console.log('✅ 对话完成');
@@ -378,7 +346,7 @@ HTML_CONTENT = """
         }
 
         // =========================
-        // 播放音频块
+        // 立即播放音频块
         // =========================
         async function playAudioChunk(messageId, audioBase64) {
             try {
@@ -390,13 +358,11 @@ HTML_CONTENT = """
                 }
                 const byteArray = new Uint8Array(byteNumbers);
 
-                // 添加到播放器
-                await audioPlayer.addAudioChunk(messageId, byteArray.buffer, 24000);
-                console.log('✅ 音频块已开始播放');
+                // 立即播放（不等待）
+                await audioPlayer.playChunk(byteArray.buffer, 24000);
 
             } catch (e) {
                 console.error('❌ 音频播放失败:', e);
-                addErrorMessage('音频播放失败: ' + e.message);
             }
         }
 
@@ -404,13 +370,24 @@ HTML_CONTENT = """
         // 标记音频播放完成
         // =========================
         function markAudioDone(messageId) {
-            audioPlayer.markDone(messageId);
-            const audioContainer = document.querySelector(`#${messageId} .audio-container`);
-            if (audioContainer) {
+            const messageElement = document.getElementById(messageId);
+            if (messageElement) {
+                let audioContainer = messageElement.querySelector('.audio-container');
+                if (!audioContainer) {
+                    audioContainer = document.createElement('div');
+                    audioContainer.className = 'audio-container';
+                    messageElement.appendChild(audioContainer);
+                }
+
                 const status = audioContainer.querySelector('.audio-status');
                 if (status) {
                     status.className = 'audio-status done';
                     status.textContent = '音频已播放完成';
+                } else {
+                    const newStatus = document.createElement('div');
+                    newStatus.className = 'audio-status done';
+                    newStatus.textContent = '音频已播放完成';
+                    audioContainer.appendChild(newStatus);
                 }
             }
         }
@@ -607,9 +584,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     for chunk in stream:
                         delta = chunk.choices[0].delta
 
-                        # 处理文本
+                        # ⭐ 立即发送文本块（流式）
                         if hasattr(delta, "content") and delta.content:
-                            print(f"[{message_id}] 收到文本: {delta.content}")
+                            print(f"[{message_id}] 发送文本: {delta.content}")
                             await websocket.send_json({
                                 "type": "text",
                                 "content": delta.content,
@@ -617,10 +594,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             })
                             assistant_reply += delta.content
 
-                        # 处理音频 - 立即发送每个块，不等待完整音频
+                        # ⭐ 立即发送音频块（流式，不收集）
                         if hasattr(delta, "audio") and delta.audio:
                             audio_data = delta.audio
-                            print(f"[{message_id}] 收到音频块")
+                            print(f"[{message_id}] 发送音频块")
 
                             try:
                                 audio_bytes = None
@@ -636,19 +613,16 @@ async def websocket_endpoint(websocket: WebSocket):
                                     audio_bytes = audio_data
 
                                 if audio_bytes:
-                                    # 立即发送音频块（流式播放）
+                                    # ⭐ 立即发送，不等待其他块
                                     audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
                                     await websocket.send_json({
                                         "type": "audio",
                                         "audio_data": audio_base64,
                                         "message_id": message_id
                                     })
-                                    print(f"[{message_id}] 音频块已发送: {len(audio_base64)} chars")
 
                             except Exception as e:
                                 print(f"[{message_id}] 音频处理错误: {e}")
-                                import traceback
-                                traceback.print_exc()
 
                     # 添加 AI 回复到历史
                     conversation_history.append({
